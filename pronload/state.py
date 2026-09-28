@@ -7,7 +7,9 @@ offene/abgebrochene Videos weiter geladen, fertige nie doppelt. Mehrere Prozesse
 from __future__ import annotations
 
 import os
+import socket
 import sqlite3
+import sys
 import threading
 import time
 import uuid
@@ -57,6 +59,41 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 """
 
 
+HOST = socket.gethostname()
+
+
+def pid_alive(pid: int) -> bool:
+    """Läuft der Prozess noch? (nur für diesen Rechner aussagekräftig)"""
+    if pid == os.getpid():
+        return True
+    if sys.platform == "win32":
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return kernel32.GetLastError() == 5  # Zugriff verweigert = existiert
+        code = ctypes.c_ulong()
+        kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+        kernel32.CloseHandle(handle)
+        return code.value == 259  # STILL_ACTIVE
+    try:
+        os.kill(pid, 0)  # Signal 0 = nur prüfen (unter Windows NICHT verwenden, das beendet!)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def owner_dead(owner: str) -> bool:
+    """Gehört die Reservierung einem beendeten Prozess auf diesem Rechner?"""
+    if owner.count(":") >= 2:  # "host:pid:zufall"
+        host, pid, _ = owner.rsplit(":", 2)
+    else:                      # altes Format "pid-zufall" (immer lokal)
+        host, pid = HOST, owner.split("-", 1)[0]
+    return host == HOST and pid.isdigit() and not pid_alive(int(pid))
+
+
 def _is_lock_error(e: sqlite3.OperationalError) -> bool:
     msg = str(e).lower()
     return "locked" in msg or "busy" in msg
@@ -69,7 +106,7 @@ class State:
         self._db = sqlite3.connect(path, check_same_thread=False, isolation_level=None, timeout=30)
         self._lock = threading.Lock()
         # Eindeutige Kennung dieses Prozesses für Reservierungen (mehrere Terminals, gleicher Ordner)
-        self.owner = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        self.owner = f"{HOST}:{os.getpid()}:{uuid.uuid4().hex[:6]}"
 
         def setup(db: sqlite3.Connection) -> None:
             db.execute("PRAGMA journal_mode=WAL")
@@ -78,6 +115,7 @@ class State:
             # Migrationen älterer Datenbanken
             for table, column, decl in (("pages", "prio", "INTEGER NOT NULL DEFAULT 1"),
                                         ("pages", "claimed_at", "REAL"),
+                                        ("pages", "claimed_by", "TEXT"),
                                         ("videos", "claimed_by", "TEXT"),
                                         ("videos", "claimed_at", "REAL")):
                 if column not in {row[1] for row in db.execute(f"PRAGMA table_info({table})")}:
@@ -163,18 +201,27 @@ class State:
         Videoseiten zuerst, dann Breitensuche über den Rest; optional nur bestimmte Seiten."""
         cond, args = self._host_filter("url", hosts)
         rows = self._q(
-            "UPDATE pages SET status='fetching', claimed_at=? WHERE rowid = ("
+            "UPDATE pages SET status='fetching', claimed_at=?, claimed_by=? WHERE rowid = ("
             f"SELECT rowid FROM pages WHERE status='queued' AND {cond} "
             "ORDER BY prio, depth, rowid LIMIT 1) RETURNING url, depth",
-            (time.time(), *args))
+            (time.time(), self.owner, *args))
         return rows[0] if rows else None
 
-    def release_stale(self, page_after: float = 300, video_after: float = CLAIM_TTL) -> None:
-        """Reservierungen abgestürzter/abgebrochener Prozesse wieder freigeben."""
+    def release_stale(self, page_after: float = 300, video_after: float = CLAIM_TTL) -> int:
+        """Reservierungen abgestürzter/beendeter Prozesse freigeben: lokal sofort (Prozess tot),
+        sonst nach Zeitablauf. Liefert die Zahl freigegebener Videos."""
         now = time.time()
+        freed = 0
+        dead = [o for (o,) in self._q("SELECT DISTINCT claimed_by FROM videos WHERE claimed_by IS NOT NULL "
+                                      "UNION SELECT DISTINCT claimed_by FROM pages WHERE status='fetching' "
+                                      "AND claimed_by IS NOT NULL") if owner_dead(o)]
+        for owner in dead:
+            freed += self._n("UPDATE videos SET claimed_by=NULL WHERE claimed_by=?", (owner,))
+            self._n("UPDATE pages SET status='queued' WHERE status='fetching' AND claimed_by=?", (owner,))
         self._n("UPDATE pages SET status='queued' WHERE status='fetching' AND "
                 "(claimed_at IS NULL OR claimed_at < ?)", (now - page_after,))
-        self._n("UPDATE videos SET claimed_by=NULL WHERE claimed_at < ?", (now - video_after,))
+        freed += self._n("UPDATE videos SET claimed_by=NULL WHERE claimed_at < ?", (now - video_after,))
+        return freed
 
     def unfetch(self, url: str) -> None:
         self._n("UPDATE pages SET status='queued' WHERE url=? AND status='fetching'", (url,))

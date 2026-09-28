@@ -214,6 +214,21 @@ def test_parallel_claims() -> None:
         b.release_stale()
         check(a.queue_sizes()[1] == 3, "hängengebliebene Seiten-Reservierungen werden freigegeben")
 
+        # Prozess wurde hart beendet (Taskmanager/Kill): Reservierung ist frisch, Prozess aber tot
+        from pronload.state import HOST
+        for dead_owner in (f"{HOST}:4000000:abcdef", "4000001-deadbeef"):  # neues + altes Format
+            a._q("UPDATE videos SET claimed_by=?, claimed_at=? WHERE page_url LIKE '%v0/'",
+                 (dead_owner, time.time()))
+            check(not b.claim_video("https://x.test/videos/v0/"), f"frische Reservierung blockiert ({dead_owner})")
+            b.release_stale()
+            check(b.claim_video("https://x.test/videos/v0/"), f"… aber toter Prozess wird sofort erkannt ({dead_owner})")
+            b.release_all()
+        a._q("UPDATE videos SET claimed_by=?, claimed_at=? WHERE page_url LIKE '%v0/'",
+             (f"anderer-rechner:{os.getpid()}:abcdef", time.time()))
+        b.release_stale()
+        check(not b.claim_video("https://x.test/videos/v0/"),
+              "Reservierung eines anderen Rechners wird nicht angefasst (nur Zeitablauf)")
+
         # Fremder Prozess hält eine Schreibsperre länger als SQLites eigenes Warten -> wiederholen
         import sqlite3
         import pronload.state as st_mod

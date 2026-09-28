@@ -4,12 +4,14 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 from rich.console import Console
 from rich.live import Live
 from rich.table import Table
 
+from . import __version__
 from .crawler import Crawler, bare_host
 from .net import NetGuard
 from .downloader import Display, Downloader
@@ -60,6 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--retry-failed", action="store_true", help="fehlgeschlagene Videos erneut versuchen")
 
     p.add_argument("--status", action="store_true", help="Stand anzeigen und beenden")
+    p.add_argument("--version", action="version", version=f"pronload {__version__}")
     p.add_argument("-v", "--verbose", action="store_true", help="yt-dlp-Meldungen anzeigen")
     return p
 
@@ -205,15 +208,25 @@ def main(argv: list[str] | None = None) -> int:
                 console.print(f"[cyan]▶[/] {video.title or video.page_url}  [dim]{video.page_url}[/]",
                               highlight=False)
 
+        last_refill = [time.monotonic()]
+
+        def refill() -> int:
+            """Offene Videos (neu frei gewordene Reservierungen, Neustarts anderer Prozesse) einreihen."""
+            last_refill[0] = time.monotonic()
+            if not dl:
+                return 0
+            state.release_stale()
+            return sum(dl.submit(v) for v in state.pending_videos(MAX_ATTEMPTS, focus))
+
         def on_tick(url: str) -> None:
+            if time.monotonic() - last_refill[0] > 60:
+                refill()
             done, queued = state.queue_sizes(focus)
             display.overview.update(crawl_task, total=done + queued, completed=done,
                                     info=f"{found} Videoseiten · {url[-60:]}")
 
         try:
-            if dl:  # Unfertiges vom letzten Lauf zuerst (inkl. .part-Fortsetzung)
-                for video in state.pending_videos(MAX_ATTEMPTS, focus):
-                    dl.submit(video)
+            refill()  # Unfertiges vom letzten Lauf zuerst (inkl. .part-Fortsetzung)
             if not args.no_crawl:
                 crawler.run(on_video, on_tick, should_stop=lambda: False, focus=focus)
             done, queued = state.queue_sizes(focus)
@@ -221,7 +234,7 @@ def main(argv: list[str] | None = None) -> int:
                                     info=f"fertig · {found} Videoseiten" +
                                          (f" · {queued} Seiten offen (--max-pages)" if queued else ""))
             if dl:
-                dl.wait()
+                dl.wait(refill)
         except KeyboardInterrupt:
             console.print("\n[yellow]Abbruch – laufende Downloads werden angehalten, "
                           "Stand ist gespeichert. Einfach nochmal starten zum Fortsetzen.[/]")

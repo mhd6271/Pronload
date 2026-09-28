@@ -9,7 +9,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 from urllib.parse import urlparse
 
 import requests
@@ -160,26 +160,37 @@ class Downloader:
             self.base_opts["cookiesfrombrowser"] = (cookies_from_browser,)
 
     # ------------------------------------------------------------------------
-    def submit(self, video: Video) -> None:
+    def submit(self, video: Video) -> bool:
         with self._lock:
             if video.page_url in self._active:
-                return
+                return False
             # lädt gerade ein anderer pronload-Prozess (anderer Tab) dasselbe Video? -> überspringen
             if not self.state.claim_video(video.page_url):
-                return
+                return False
             self._active.add(video.page_url)
             self._submitted += 1
             self.display.overview.update(self.overall, total=self._submitted)
         self._pool.submit(self._run, video)
+        return True
 
     def busy(self) -> bool:
         with self._lock:
             return bool(self._active)
 
-    def wait(self) -> None:
-        # Polling statt join(), damit Strg+C unter Windows sofort ankommt
-        while self.busy():
-            time.sleep(0.2)
+    def wait(self, refill: Callable[[], int] | None = None, every: float = 60) -> None:
+        """Warten, bis alles geladen ist. refill() holt regelmäßig neu frei gewordene/offene Videos
+        (z.B. von einem beendeten anderen Prozess) und liefert die Zahl neu eingereihter."""
+        last = time.monotonic()
+        while True:
+            # Polling statt join(), damit Strg+C unter Windows sofort ankommt
+            while self.busy():
+                time.sleep(0.2)
+                if refill and time.monotonic() - last > every:
+                    refill()
+                    last = time.monotonic()
+            if not refill or not refill():
+                break
+            last = time.monotonic()
         self._pool.shutdown(wait=True)
         self._close()
 
