@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pronload"
+version = "0.1.0"
+description = "Webseiten crawlen und eingebettete Videos archivieren (yt-dlp-basiert)"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = ["yt-dlp>=2025.1.1", "requests>=2.31", "rich>=13.7", "textual>=0.80"]
+
+[project.scripts]
+pronload = "pronload.cli:main"
+
+[tool.setuptools]
+packages = ["pronload"]

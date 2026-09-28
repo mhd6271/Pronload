@@ -1,0 +1,10 @@
+__pycache__/
+*.egg-info/
+build/
+.venv/
+.pronload.db*
+.pronload-archive.txt
+*.part
+*.mp4
+*.webm
+*.mkv
