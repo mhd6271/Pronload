@@ -10,7 +10,8 @@ Kommandozeilen-Tool, das eine Webseite crawlt und alle eingebetteten Videos arch
 - **Basiert auf [yt-dlp](https://github.com/yt-dlp/yt-dlp):** kennt über 1800 Seiten und viele eingebettete Player, KVS-Seiten eingeschlossen.
 
 ```
-<img width="1745" height="338" alt="image" src="https://github.com/user-attachments/assets/d41e6550-b622-4255-8884-5c67971ffcdf" />
+<img width="1745" height="338" alt="image" src="https://github.com/user-attachments/assets/f0991862-73cb-470b-adc4-5e8ba6c0811b" />
+
 
 ```
 
