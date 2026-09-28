@@ -120,13 +120,8 @@ class Downloader:
         self.overall = display.overview.add_task("Videos", total=0, info="")
         self._closed = threading.Event()
         threading.Thread(target=self._heartbeat, daemon=True, name="claims").start()
-        self._http = requests.Session()
-        self._http.headers["User-Agent"] = USER_AGENT
-        if cookies:
-            from http.cookiejar import MozillaCookieJar
-            jar = MozillaCookieJar(cookies)
-            jar.load(ignore_discard=True, ignore_expires=True)
-            self._http.cookies.update(jar)
+        self._cookie_file = cookies
+        self._tls = threading.local()  # eine HTTP-Session pro Download-Thread
 
         self.base_opts: dict = {
             # ohne ffmpeg kein Zusammenführen getrennter Video-/Audiospuren
@@ -226,7 +221,9 @@ class Downloader:
             #    beste Qualität zuerst; gespeicherte URLs nur, wenn die Seite nicht lädt
             def attempts():
                 yield page_url
-                yield from rank_media(self._fresh_media(page_url) or media)  # erst bei Bedarf laden
+                fresh = rank_media(self._fresh_media(page_url))  # erst bei Bedarf laden
+                yield from fresh
+                yield from (m for m in rank_media(media) if m not in fresh)  # beim Crawlen gespeicherte
 
             for url in attempts():
                 try:
@@ -258,9 +255,21 @@ class Downloader:
             with self._lock:
                 self._active.discard(page_url)
 
+    def _session(self) -> requests.Session:
+        s = getattr(self._tls, "session", None)
+        if s is None:
+            s = self._tls.session = requests.Session()
+            s.headers["User-Agent"] = USER_AGENT
+            if self._cookie_file:
+                from http.cookiejar import MozillaCookieJar
+                jar = MozillaCookieJar(self._cookie_file)
+                jar.load(ignore_discard=True, ignore_expires=True)
+                s.cookies.update(jar)
+        return s
+
     def _fresh_media(self, page_url: str) -> list[str]:
         try:
-            r = self._http.get(page_url, timeout=25)
+            r = self._session().get(page_url, timeout=25)
             r.raise_for_status()
             return analyze(page_url, r.text).media
         except Exception:  # noqa: BLE001 - dann gespeicherte URLs verwenden
@@ -287,6 +296,10 @@ class Downloader:
                     http_headers={"Referer": referer})
         ext = path_ext(url.rstrip("/"))
         with yt_dlp.YoutubeDL(opts) as ydl:
+            # Cookies vom Seitenabruf mitgeben: Zugangs-Tokens in Links (z.B. v-acctoken)
+            # gelten oft nur zusammen mit der Session, in der die Seite geladen wurde
+            for cookie in self._session().cookies:
+                ydl.cookiejar.set_cookie(cookie)
             if url != referer and (ext in DIRECT_EXT or "/get_file/" in url):
                 # Direkte Datei: am Generic-Extractor vorbei (der scheitert z.B. an KVS' ".mp4/"),
                 # yt-dlp lädt sie trotzdem mit Fortschritt + Fortsetzen

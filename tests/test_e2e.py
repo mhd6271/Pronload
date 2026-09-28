@@ -30,6 +30,7 @@ INDEX = f"""<html><head><title>Startseite | FakeTube</title></head><body>{NAV}
 <div class="thumb"><a href="/videos/zweites-video/">2</a><video src="/media/preview/2.mp4"></video></div>
 <div class="thumb"><a href="/videos/drittes-video/">3</a><video src="/media/preview/3.mp4"></video></div>
 <div class="thumb"><a href="/videos/viertes-video/">4</a><video src="/media/preview/4.mp4"></video></div>
+<div class="thumb"><a href="/videos/fuenftes-video/">5</a></div>
 <a href="/page/2/">weiter</a></body></html>"""
 
 PAGE2 = f"""<html><head><title>Seite 2 | FakeTube</title></head><body>{NAV}
@@ -80,6 +81,15 @@ kt_player('kt_player', '/player/kt_player.swf', '100%', '100%', flashvars_1005);
 </body></html>"""
 
 
+def kvs_session_page() -> str:
+    """Link funktioniert nur mit dem Cookie, das die Seite setzt (wie KVS mit v-acctoken)."""
+    s = kvs_scramble(KVS_HASH, KVS_LICENSE)
+    return f"""<html><head><title>Fuenftes Video (Session) | FakeTube</title></head><body>{NAV}
+<script>var flashvars_2006 = {{ license_code: '{KVS_LICENSE}',
+ video_url: 'function/0/{BASE}/get_file/2/{s}/2000/2006/2006_720p.mp4/?v-acctoken=abc' }};</script>
+</body></html>"""
+
+
 VIDEOS = [
     ("erstes-video", "Erstes Video: Test & Co", "anna-muster", "amateur"),
     ("zweites-video", "Zweites Video", "berta-beispiel", "outdoor"),
@@ -103,6 +113,8 @@ def build_site(root: Path) -> None:
     w("videos/viertes-video/index.html", kvs_page())
     w(f"get_file/1/{KVS_HASH}/1000/1005/1005_480p.mp4", os.urandom(300_000))
     w(f"get_file/1/{KVS_HASH}/1000/1005/1005_1080p.mp4", os.urandom(2_000_000))
+    w("videos/fuenftes-video/index.html", kvs_session_page())
+    w(f"get_file/2/{KVS_HASH}/2000/2006/2006_720p.mp4", os.urandom(400_000))
     for i in range(1, 5):
         w(f"media/preview/{i}.mp4", os.urandom(1000))
 
@@ -112,11 +124,19 @@ def serve(root: Path) -> ThreadingHTTPServer:
         def log_message(self, *a) -> None:
             pass
 
+        def end_headers(self) -> None:
+            if self.path.startswith("/videos/fuenftes-video"):
+                self.send_header("Set-Cookie", "kt_session=ok; Path=/")
+            super().end_headers()
+
         def do_GET(self) -> None:  # minimale Range-Unterstützung zum Testen von Fortsetzen
             REQUESTS.append(self.path)
             HOSTS.append(self.headers.get("Host", "").split(":")[0])
+            if self.path.startswith("/get_file/2/") and "kt_session=ok" not in self.headers.get("Cookie", ""):
+                self.send_error(403)  # ohne Session-Cookie der Videoseite kein Zugriff
+                return
             if self.path.startswith("/get_file/"):
-                self.path = self.path.rstrip("/")  # KVS-Links enden auf ".mp4/"
+                self.path = self.path.split("?")[0].rstrip("/")  # KVS-Links enden auf ".mp4/"
             rng = self.headers.get("Range")
             path = Path(self.translate_path(self.path))
             if not rng or not path.is_file():
@@ -176,6 +196,18 @@ def test_parallel_claims() -> None:
         b.release_stale()
         check(a.queue_sizes()[1] == 3, "hängengebliebene Seiten-Reservierungen werden freigegeben")
 
+        # Fremder Prozess hält eine Schreibsperre länger als SQLites eigenes Warten -> wiederholen
+        import sqlite3
+        import pronload.state as st_mod
+        blocker = sqlite3.connect(db, isolation_level=None, check_same_thread=False)
+        blocker.execute("BEGIN IMMEDIATE")
+        threading.Timer(1.5, lambda: blocker.execute("COMMIT")).start()
+        c = State(db)
+        c._db.execute("PRAGMA busy_timeout = 100")  # SQLite gibt nach 0,1 s auf ...
+        n = c.enqueue_many((f"https://x.test/viele/{i}/", 2, 1) for i in range(500))
+        check(n == 500, "... pronload wiederholt trotzdem, bis die Sperre weg ist (500 Links in einer Transaktion)")
+        check(st_mod.LOCK_PATIENCE >= 60, "Geduld bei Sperren reicht für parallele Terminals")
+
 
 def run() -> None:
     test_detection()
@@ -197,12 +229,14 @@ def run() -> None:
                   "Sortiervarianten zuletzt")
             files = sorted(p.relative_to(out).as_posix() for p in out.rglob("*.mp4"))
             print("     " + "\n     ".join(files))
-            check(len(files) == 4, "genau 4 Videos geladen (keine Previews, keine Duplikate)")
+            check(len(files) == 5, "genau 5 Videos geladen (keine Previews, keine Duplikate)")
+            check(any("Fuenftes Video (Session)" in f for f in files),
+                  "Link mit Zugangs-Token: Session-Cookie der Seite wird an yt-dlp weitergegeben")
             check(all(f.startswith("127.0.0.1/") for f in files), "Ordner pro Seite")
             check(sum("/Anna Muster/" in f for f in files) == 2, "2 Videos im Model-Ordner Anna Muster")
             check(any("/Erstes Video Test & Co [" in f for f in files), "Name aus Seitentitel")
             check(not any("FakeTube" in f for f in files), "Seitenname aus dem Titel entfernt")
-            check(all((out / f).stat().st_size == 1_500_000 for f in files if "KVS" not in f),
+            check(all((out / f).stat().st_size == 1_500_000 for f in files if "(" not in f),
                   "jeweils beste Qualität (720p)")
             kvs = [f for f in files if "Viertes Video (KVS)" in f]
             for url, _, err in State(out / ".pronload.db").failed():
@@ -225,7 +259,7 @@ def run() -> None:
             check(files2 == files and all((out / f).stat().st_mtime_ns == mtimes[f] for f in files),
                   "zweiter Lauf lädt nichts doppelt")
             stats = State(out / ".pronload.db").stats()
-            check(stats.get("videos.done") == 4, f"Status: 4 fertig ({stats})")
+            check(stats.get("videos.done") == 5, f"Status: 5 fertig ({stats})")
             check(stats.get("pages.error", 0) == 0, "404-Seiten gelten als erledigt, nicht als Fehler")
 
             # Abgebrochenen Download simulieren: halbe .part-Datei, Video wieder 'pending'

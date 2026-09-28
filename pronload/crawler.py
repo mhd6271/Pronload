@@ -53,6 +53,7 @@ class Crawler:
         self._robots: dict[str, RobotFileParser | None] = {}
         self._last_request = 0.0
         self.fetched = 0
+        self.errors: list[str] = []
         state.reprioritize(self.priority)
 
     def priority(self, url: str) -> int:
@@ -181,6 +182,9 @@ class Crawler:
             on_tick(url)
             try:
                 self._process(url, depth, on_video)
+            except Exception as e:  # noqa: BLE001 - eine kaputte Seite darf den Lauf nicht beenden
+                self.errors.append(f"{url}: {type(e).__name__}: {e}")
+                self.state.finish_page(url, "error")  # beim nächsten Lauf nochmal
             except BaseException:
                 self.state.unfetch(url)  # Strg+C mitten im Abruf: Seite zurück in die Warteschlange
                 raise
@@ -216,7 +220,7 @@ class Crawler:
             # Kategorie-/Model-Links der Startseite = Navigation, gilt für jede Seite
             self.learn_site(info)
         if self.max_depth is None or depth < self.max_depth:
-            for link in info.links:
-                if self.in_scope(link):
-                    self.state.enqueue(link, depth + 1, self.priority(link))
+            # alle Links einer Seite in einer Transaktion (statt ein Commit pro Link)
+            self.state.enqueue_many((link, depth + 1, self.priority(link))
+                                    for link in info.links if self.in_scope(link))
         self.state.finish_page(url, "done", is_video)

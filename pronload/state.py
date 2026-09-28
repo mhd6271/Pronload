@@ -1,7 +1,8 @@
 """Persistenter Stand (SQLite): Crawl-Warteschlange + Video-Status.
 
 Dadurch ist jeder Lauf wiederaufnehmbar: offene Seiten werden weiter gecrawlt,
-offene/abgebrochene Videos weiter geladen, fertige nie doppelt.
+offene/abgebrochene Videos weiter geladen, fertige nie doppelt. Mehrere Prozesse
+(Terminals) dürfen gleichzeitig auf dieselbe Datenbank zugreifen.
 """
 from __future__ import annotations
 
@@ -12,10 +13,12 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
 
 # Reservierung eines Videos läuft ab, wenn der Prozess sie so lange nicht erneuert (Absturz)
 CLAIM_TTL = 180
+# So lange wird bei "database is locked" insgesamt wiederholt, bevor aufgegeben wird
+LOCK_PATIENCE = 300
 
 
 @dataclass
@@ -26,12 +29,13 @@ class Video:
     category: str | None = None
     model: str | None = None
 
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS pages (
     url      TEXT PRIMARY KEY,
     depth    INTEGER NOT NULL,
     prio     INTEGER NOT NULL DEFAULT 1,       -- 0 = vermutlich Videoseite (zuerst), 2 = Sortiervariante
-    status   TEXT NOT NULL DEFAULT 'queued',   -- queued | done | error | skipped
+    status   TEXT NOT NULL DEFAULT 'queued',   -- queued | fetching | done | error | skipped
     is_video INTEGER NOT NULL DEFAULT 0,
     added    REAL NOT NULL
 );
@@ -53,28 +57,71 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 """
 
 
+def _is_lock_error(e: sqlite3.OperationalError) -> bool:
+    msg = str(e).lower()
+    return "locked" in msg or "busy" in msg
+
+
 class State:
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        # timeout: andere pronload-Prozesse auf demselben Ordner halten kurz Schreibsperren
-        self._db = sqlite3.connect(path, check_same_thread=False, isolation_level=None, timeout=60)
-        self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.executescript(SCHEMA)
-        # Migrationen älterer Datenbanken
-        for table, column, decl in (("pages", "prio", "INTEGER NOT NULL DEFAULT 1"),
-                                    ("pages", "claimed_at", "REAL"),
-                                    ("videos", "claimed_by", "TEXT"),
-                                    ("videos", "claimed_at", "REAL")):
-            if column not in {row[1] for row in self._db.execute(f"PRAGMA table_info({table})")}:
-                self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
-        self._db.execute("CREATE INDEX IF NOT EXISTS pages_queue ON pages(status, prio, depth)")
+        # timeout = SQLite-eigenes Warten auf fremde Schreibsperren; darüber hinaus wiederholt _run()
+        self._db = sqlite3.connect(path, check_same_thread=False, isolation_level=None, timeout=30)
         self._lock = threading.Lock()
-        # Eindeutige Kennung dieses Prozesses für Reservierungen (mehrere Tabs, gleicher Ordner)
+        # Eindeutige Kennung dieses Prozesses für Reservierungen (mehrere Terminals, gleicher Ordner)
         self.owner = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
+        def setup(db: sqlite3.Connection) -> None:
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA synchronous=NORMAL")  # in WAL sicher und deutlich schneller
+            db.executescript(SCHEMA)
+            # Migrationen älterer Datenbanken
+            for table, column, decl in (("pages", "prio", "INTEGER NOT NULL DEFAULT 1"),
+                                        ("pages", "claimed_at", "REAL"),
+                                        ("videos", "claimed_by", "TEXT"),
+                                        ("videos", "claimed_at", "REAL")):
+                if column not in {row[1] for row in db.execute(f"PRAGMA table_info({table})")}:
+                    db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+            db.execute("CREATE INDEX IF NOT EXISTS pages_queue ON pages(status, prio, depth)")
+        self._run(setup)
+
+    # --- Low-Level: jeder Zugriff geht hier durch --------------------------------
+    def _run(self, fn: Callable[[sqlite3.Connection], object]) -> object:
+        """fn unter Thread-Lock ausführen; bei Sperren durch andere Prozesse geduldig wiederholen."""
+        deadline = time.monotonic() + LOCK_PATIENCE
+        delay = 0.2
+        while True:
+            try:
+                with self._lock:
+                    return fn(self._db)
+            except sqlite3.OperationalError as e:
+                if not _is_lock_error(e) or time.monotonic() > deadline:
+                    raise
+                time.sleep(delay)
+                delay = min(delay * 1.5, 3.0)
+
     def _q(self, sql: str, args: tuple = ()) -> list[tuple]:
-        with self._lock:
-            return self._db.execute(sql, args).fetchall()
+        return self._run(lambda db: db.execute(sql, args).fetchall())
+
+    def _n(self, sql: str, args: tuple = ()) -> int:
+        """Wie _q, liefert aber die Zahl der geänderten Zeilen."""
+        return self._run(lambda db: db.execute(sql, args).rowcount)
+
+    def _many(self, sql: str, rows: list[tuple]) -> int:
+        """Viele Schreibzugriffe in EINER Transaktion (sonst ein Commit pro Zeile)."""
+        if not rows:
+            return 0
+
+        def tx(db: sqlite3.Connection) -> int:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                n = sum(db.execute(sql, r).rowcount for r in rows)
+                db.execute("COMMIT")
+                return n
+            except BaseException:
+                db.rollback()
+                raise
+        return self._run(tx)
 
     # --- Einstellungen des Laufs (für Fortsetzen ohne Argumente) --------------
     def get_meta(self, key: str) -> str | None:
@@ -104,15 +151,15 @@ class State:
 
     # --- Crawl-Warteschlange -------------------------------------------------
     def enqueue(self, url: str, depth: int, prio: int = 1) -> bool:
-        with self._lock:
-            cur = self._db.execute(
-                "INSERT OR IGNORE INTO pages(url, depth, prio, added) VALUES (?, ?, ?, ?)",
-                (url, depth, prio, time.time()),
-            )
-            return cur.rowcount > 0
+        return self.enqueue_many([(url, depth, prio)]) > 0
+
+    def enqueue_many(self, items: Iterable[tuple[str, int, int]]) -> int:
+        now = time.time()
+        return self._many("INSERT OR IGNORE INTO pages(url, depth, prio, added) VALUES (?, ?, ?, ?)",
+                          [(u, d, p, now) for u, d, p in items])
 
     def next_page(self, hosts: set[str] | None = None) -> tuple[str, int] | None:
-        """Nächste Seite holen UND reservieren (atomar), damit parallele Tabs sie nicht doppelt holen.
+        """Nächste Seite holen UND reservieren (atomar), damit parallele Prozesse sie nicht doppelt holen.
         Videoseiten zuerst, dann Breitensuche über den Rest; optional nur bestimmte Seiten."""
         cond, args = self._host_filter("url", hosts)
         rows = self._q(
@@ -125,47 +172,38 @@ class State:
     def release_stale(self, page_after: float = 300, video_after: float = CLAIM_TTL) -> None:
         """Reservierungen abgestürzter/abgebrochener Prozesse wieder freigeben."""
         now = time.time()
-        with self._lock:
-            self._db.execute("UPDATE pages SET status='queued' WHERE status='fetching' AND "
-                             "(claimed_at IS NULL OR claimed_at < ?)", (now - page_after,))
-            self._db.execute("UPDATE videos SET claimed_by=NULL WHERE claimed_at < ?", (now - video_after,))
+        self._n("UPDATE pages SET status='queued' WHERE status='fetching' AND "
+                "(claimed_at IS NULL OR claimed_at < ?)", (now - page_after,))
+        self._n("UPDATE videos SET claimed_by=NULL WHERE claimed_at < ?", (now - video_after,))
 
     def unfetch(self, url: str) -> None:
-        self._q("UPDATE pages SET status='queued' WHERE url=? AND status='fetching'", (url,))
+        self._n("UPDATE pages SET status='queued' WHERE url=? AND status='fetching'", (url,))
 
     def reprioritize(self, prio_of: Callable[[str], int]) -> int:
         """Priorität der offenen Seiten neu berechnen (Migration / geändertes --video-pattern)."""
         rows = self._q("SELECT url, prio FROM pages WHERE status='queued'")
-        changes = [(p, u) for u, old in rows if (p := prio_of(u)) != old]
-        with self._lock:
-            self._db.executemany("UPDATE pages SET prio=? WHERE url=?", changes)
-        return len(changes)
+        return self._many("UPDATE pages SET prio=? WHERE url=?",
+                          [(p, u) for u, old in rows if (p := prio_of(u)) != old])
 
     def finish_page(self, url: str, status: str, is_video: bool = False) -> None:
-        self._q("UPDATE pages SET status=?, is_video=? WHERE url=?", (status, int(is_video), url))
+        self._n("UPDATE pages SET status=?, is_video=? WHERE url=?", (status, int(is_video), url))
 
     def refresh_listings(self) -> int:
         """Übersichtsseiten (keine Videoseiten) neu einreihen, um neue Uploads zu finden."""
-        with self._lock:
-            return self._db.execute(
-                "UPDATE pages SET status='queued' WHERE is_video=0 AND status NOT IN ('queued', 'fetching')"
-            ).rowcount
+        return self._n("UPDATE pages SET status='queued' WHERE is_video=0 "
+                       "AND status NOT IN ('queued', 'fetching')")
 
     def requeue_page_errors(self) -> int:
-        with self._lock:
-            return self._db.execute("UPDATE pages SET status='queued' WHERE status='error'").rowcount
+        return self._n("UPDATE pages SET status='queued' WHERE status='error'")
 
     # --- Videos --------------------------------------------------------------
-    def add_video(self, v: "Video") -> bool:
-        with self._lock:
-            cur = self._db.execute(
-                "INSERT OR IGNORE INTO videos(page_url, title, media, category, model, updated) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (v.page_url, v.title, "\n".join(v.media), v.category, v.model, time.time()),
-            )
-            return cur.rowcount > 0
+    def add_video(self, v: Video) -> bool:
+        return self._n(
+            "INSERT OR IGNORE INTO videos(page_url, title, media, category, model, updated) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (v.page_url, v.title, "\n".join(v.media), v.category, v.model, time.time())) > 0
 
-    def pending_videos(self, max_attempts: int, hosts: set[str] | None = None) -> list["Video"]:
+    def pending_videos(self, max_attempts: int, hosts: set[str] | None = None) -> list[Video]:
         cond, args = self._host_filter("page_url", hosts)
         rows = self._q(
             "SELECT page_url, title, media, category, model FROM videos "
@@ -180,33 +218,30 @@ class State:
     def claim_video(self, page_url: str) -> bool:
         """True, wenn dieser Prozess das Video laden darf (frei, eigene oder abgelaufene Reservierung)."""
         now = time.time()
-        with self._lock:
-            return self._db.execute(
-                "UPDATE videos SET claimed_by=?, claimed_at=? WHERE page_url=? AND status!='done' AND "
-                "(claimed_by IS NULL OR claimed_by=? OR claimed_at < ?)",
-                (self.owner, now, page_url, self.owner, now - CLAIM_TTL)).rowcount > 0
+        return self._n(
+            "UPDATE videos SET claimed_by=?, claimed_at=? WHERE page_url=? AND status!='done' AND "
+            "(claimed_by IS NULL OR claimed_by=? OR claimed_at < ?)",
+            (self.owner, now, page_url, self.owner, now - CLAIM_TTL)) > 0
 
     def touch_claims(self) -> None:
-        self._q("UPDATE videos SET claimed_at=? WHERE claimed_by=?", (time.time(), self.owner))
+        self._n("UPDATE videos SET claimed_at=? WHERE claimed_by=?", (time.time(), self.owner))
 
     def release_video(self, page_url: str) -> None:
-        self._q("UPDATE videos SET claimed_by=NULL WHERE page_url=? AND claimed_by=?", (page_url, self.owner))
+        self._n("UPDATE videos SET claimed_by=NULL WHERE page_url=? AND claimed_by=?", (page_url, self.owner))
 
     def release_all(self) -> None:
-        self._q("UPDATE videos SET claimed_by=NULL WHERE claimed_by=?", (self.owner,))
+        self._n("UPDATE videos SET claimed_by=NULL WHERE claimed_by=?", (self.owner,))
 
     def video_done(self, page_url: str, file: str | None) -> None:
-        self._q("UPDATE videos SET status='done', file=?, error=NULL, updated=?, claimed_by=NULL "
+        self._n("UPDATE videos SET status='done', file=?, error=NULL, updated=?, claimed_by=NULL "
                 "WHERE page_url=?", (file, time.time(), page_url))
 
     def video_failed(self, page_url: str, error: str) -> None:
-        self._q("UPDATE videos SET status='failed', attempts=attempts+1, error=?, updated=?, claimed_by=NULL "
-                "WHERE page_url=?",
-                (error[:500], time.time(), page_url))
+        self._n("UPDATE videos SET status='failed', attempts=attempts+1, error=?, updated=?, claimed_by=NULL "
+                "WHERE page_url=?", (error[:1500], time.time(), page_url))
 
     def reset_failed(self) -> int:
-        with self._lock:
-            return self._db.execute("UPDATE videos SET status='pending', attempts=0 WHERE status='failed'").rowcount
+        return self._n("UPDATE videos SET status='pending', attempts=0 WHERE status='failed'")
 
     def stats(self) -> dict[str, int]:
         out: dict[str, int] = {}
