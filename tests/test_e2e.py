@@ -1,9 +1,10 @@
-"""End-to-End gegen eine lokale Fake-Tube-Seite: python tests/test_e2e.py"""
+﻿"""End-to-End gegen eine lokale Fake-Tube-Seite: python tests/test_e2e.py"""
 from __future__ import annotations
 
 import functools
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -32,6 +33,7 @@ INDEX = f"""<html><head><title>Startseite | FakeTube</title></head><body>{NAV}
 <div class="thumb"><a href="/videos/drittes-video/">3</a><video src="/media/preview/3.mp4"></video></div>
 <div class="thumb"><a href="/videos/viertes-video/">4</a><video src="/media/preview/4.mp4"></video></div>
 <div class="thumb"><a href="/videos/fuenftes-video/">5</a></div>
+<div class="thumb"><a href="/videos/sechstes-video/">6</a></div>
 <a href="/page/2/">weiter</a></body></html>"""
 
 PAGE2 = f"""<html><head><title>Seite 2 | FakeTube</title></head><body>{NAV}
@@ -115,6 +117,15 @@ def build_site(root: Path) -> None:
     w(f"get_file/1/{KVS_HASH}/1000/1005/1005_480p.mp4", os.urandom(300_000))
     w(f"get_file/1/{KVS_HASH}/1000/1005/1005_1080p.mp4", os.urandom(2_000_000))
     w("videos/fuenftes-video/index.html", kvs_session_page())
+    # sechstes Video: echter HLS-Stream in vielen Teilen (braucht ffmpeg zum Erzeugen)
+    (root / "hls").mkdir(exist_ok=True)
+    subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+                    "testsrc=duration=12:size=320x240:rate=25", "-c:v", "libx264", "-g", "25",
+                    "-f", "hls", "-hls_time", "1", "-hls_list_size", "0", str(root / "hls" / "s.m3u8")],
+                   check=True)
+    w("videos/sechstes-video/index.html",
+      f"<html><head><title>Sechstes Video (HLS) | FakeTube</title></head><body>{NAV}"
+      '<video controls><source src="/hls/s.m3u8" type="application/x-mpegURL"></video></body></html>')
     w(f"get_file/2/{KVS_HASH}/2000/2006/2006_720p.mp4", os.urandom(400_000))
     for i in range(1, 5):
         w(f"media/preview/{i}.mp4", os.urandom(1000))
@@ -238,7 +249,7 @@ def test_offline(site: Path, tmp: Path) -> None:
     servers[0].shutdown()
     stats = State(out / ".pronload.db").stats()
     check(rc == 0 and time.monotonic() - t0 >= 1.5, "Crawler pausiert ohne Netz und macht danach weiter")
-    check(stats.get("pages.error", 0) == 0 and stats.get("videos.done") == 5 and "videos.failed" not in stats,
+    check(stats.get("pages.error", 0) == 0 and stats.get("videos.done") == 6 and "videos.failed" not in stats,
           f"Ausfall beim Crawlen zählt nicht als Fehler, alles geladen ({stats})")
 
     # 2) Netz bricht während der Downloads weg -> Downloads warten, danach fertig
@@ -247,7 +258,7 @@ def test_offline(site: Path, tmp: Path) -> None:
     threading.Timer(1.5, lambda: NET.update(media_down=False)).start()
     rc = main([BASE + "/", "-o", str(out), "--delay", "0"])
     stats = State(out / ".pronload.db").stats()
-    check(rc == 0 and stats.get("videos.done") == 5 and "videos.failed" not in stats,
+    check(rc == 0 and stats.get("videos.done") == 6 and "videos.failed" not in stats,
           f"Ausfall beim Download: gewartet statt fehlgeschlagen ({stats})")
 
     # 3) Erreichbares Internet, aber die Seite selbst antwortet nicht -> normaler Fehler, keine Pause
@@ -275,7 +286,7 @@ def run() -> None:
                   "Sortiervarianten zuletzt")
             files = sorted(p.relative_to(out).as_posix() for p in out.rglob("*.mp4"))
             print("     " + "\n     ".join(files))
-            check(len(files) == 5, "genau 5 Videos geladen (keine Previews, keine Duplikate)")
+            check(len(files) == 6, "genau 6 Videos geladen (keine Previews, keine Duplikate)")
             check(any("Fuenftes Video (Session)" in f for f in files),
                   "Link mit Zugangs-Token: Session-Cookie der Seite wird an yt-dlp weitergegeben")
             check(all(f.startswith("127.0.0.1/") for f in files), "Ordner pro Seite")
@@ -305,14 +316,24 @@ def run() -> None:
             check(files2 == files and all((out / f).stat().st_mtime_ns == mtimes[f] for f in files),
                   "zweiter Lauf lädt nichts doppelt")
             stats = State(out / ".pronload.db").stats()
-            check(stats.get("videos.done") == 5, f"Status: 5 fertig ({stats})")
+            check(stats.get("videos.done") == 6, f"Status: 6 fertig ({stats})")
             check(stats.get("pages.error", 0) == 0, "404-Seiten gelten als erledigt, nicht als Fehler")
 
             # Abgebrochenen Download simulieren: halbe .part-Datei, Video wieder 'pending'
+            from pronload.downloader import TMP_DIR, _page_tag
+            check(not (out / TMP_DIR).exists() or not any((out / TMP_DIR).iterdir()),
+                  "keine Zwischendateien übrig nach erfolgreichen Downloads")
             target = next(out.rglob("Zweites Video*.mp4"))
             original = (site / "media/zweites-video_720p.mp4").read_bytes()
             target.unlink()
-            Path(str(target) + ".part").write_bytes(original[:700_000])
+            # .part liegt jetzt im Zwischenordner pro (Video, Quelle) - hier: yt-dlp über die Videoseite
+            page_url = BASE + "/videos/zweites-video/"
+            part = out / TMP_DIR / _page_tag(page_url) / "page" / (str(target.relative_to(out)) + ".part")
+            part.parent.mkdir(parents=True, exist_ok=True)
+            part.write_bytes(original[:700_000])
+            # Rest einer ALTEN Version neben der Zieldatei, aus einer anderen Quelle: darf nicht verwendet werden
+            stale = Path(str(target) + ".part")
+            stale.write_bytes(os.urandom(900_000))
             (out / ".pronload-archive.txt").write_text("")
             st = State(out / ".pronload.db")
             st._q("UPDATE videos SET status='pending' WHERE page_url LIKE '%zweites%'")
@@ -322,6 +343,13 @@ def run() -> None:
             check(target.exists() and target.read_bytes() == original, "Datei nach Fortsetzen vollständig & korrekt")
             check(any(r == "bytes=700000-" for _, r in RANGE_REQUESTS),
                   f"nur der Rest wurde geladen (Range ab Byte 700000): {RANGE_REQUESTS}")
+            check(not stale.exists(), "fremde alte .part-Datei nicht verwendet und aufgeräumt")
+
+            # HLS-Stream (wie xhamster): Teile laden, ffmpeg packt um, keine Reste
+            hls = [p for p in out.rglob("*.mp4") if "Sechstes Video (HLS)" in p.name]
+            check(len(hls) == 1 and hls[0].stat().st_size > 50_000, "HLS-Video geladen und von ffmpeg umgepackt")
+            check(not list(out.rglob("*.part-Frag*")) and not list(out.rglob("*.temp.*")),
+                  "keine .part-Frag- oder .temp-Reste im Archiv")
 
             # Fokus: zweite Seite (localhost) im selben Ordner, während für 127.0.0.1 noch was offen ist
             st = State(out / ".pronload.db")

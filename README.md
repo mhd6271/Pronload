@@ -123,7 +123,12 @@ Ein Ordner, der im Baum ausgewählt ist, filtert die Liste auf diesen Ordner ink
 <Ziel>/<domain>/[<Model|Kategorie>/]<Titel der Videoseite> [<8-stelliger Hash>].mp4
 <Ziel>/.pronload.db               # Stand: Warteschlange, Videos, Einstellungen
 <Ziel>/.pronload-archive.txt      # yt-dlp-Archiv (gleiche Video-ID nie doppelt)
+<Ziel>/.pronload-tmp/             # halbfertige Downloads (.part, Stream-Teile), pro Video und Quelle getrennt
 ```
+
+Halbfertiges liegt nicht neben den fertigen Videos. Es kommt nach `.pronload-tmp`, getrennt pro Video **und** pro Quelle, also Qualität bzw. Link. Fortgesetzt wird deshalb immer nur mit genau derselben Datei, eine alte `.part` in anderer Qualität wird nie mit untergemischt. Nach einem erfolgreichen Download wird der Zwischenordner gelöscht.
+
+Bei Streams (HLS/DASH) zeigt die Liste nach dem Download noch **„⚙ Umpacken“** bzw. **„⚙ Zusammenfügen“**. In dieser Phase baut ffmpeg die Teile zu einer MP4 zusammen, was bei großen Dateien ein paar Minuten dauern kann.
 
 - Der **Titel** kommt aus `og:title` bzw. `<title>` der Videoseite. Der Seitenname („… - FakeTube“) wird automatisch entfernt.
 - Der **Hash** leitet sich aus der URL der Videoseite ab. Dadurch ist der Dateiname bei jedem Lauf gleich, und abgebrochene Downloads werden fortgesetzt statt neu begonnen.

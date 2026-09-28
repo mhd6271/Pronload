@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from glob import escape as glob_escape
 import shutil
 import threading
 import time
@@ -22,6 +23,13 @@ from .extract import USER_AGENT, analyze, path_ext, rank_media
 from .net import NetGuard
 
 DIRECT_EXT = (".mp4", ".m4v", ".webm", ".mkv", ".mov", ".flv")
+TMP_DIR = ".pronload-tmp"
+# Postprocessoren ohne nennenswerte Laufzeit - dafür keine Anzeige umschalten
+_SILENT_PP = {"MoveFiles", "MoveFilesAfterDownload", "FFmpegMetadata", "EmbedThumbnail"}
+
+
+def _page_tag(page_url: str) -> str:
+    return hashlib.sha1(page_url.encode()).hexdigest()[:8]
 from .state import State, Video
 
 _BAD_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
@@ -195,10 +203,11 @@ class Downloader:
     # ------------------------------------------------------------------------
     def _outtmpl(self, v: Video) -> str:
         # stabiler Name -> derselbe .part-Pfad bei jedem Lauf -> Fortsetzen klappt
-        tag = hashlib.sha1(v.page_url.encode()).hexdigest()[:8]
+        # relativ zu paths.home (= Zielordner) - sonst ignoriert yt-dlp den eigenen Zwischenordner
+        tag = _page_tag(v.page_url)
         name = clean_title(v.title, v.page_url)
         stem = safe_filename(name).replace("%", "%%") if name else "%(title).150B"
-        folder = self.out_dir / site_folder(v.page_url)
+        folder = Path(site_folder(v.page_url))
         if self.sort in ("model", "category"):
             hint = v.model if self.sort == "model" else v.category
             # nichts im HTML gefunden -> Metadaten von yt-dlp, sonst "_unsortiert"
@@ -233,7 +242,8 @@ class Downloader:
                     if self.guard and not self.guard.wait(self.stop.is_set):
                         return  # abgebrochen während offline -> bleibt 'pending'
                     try:
-                        file = self._download(url, page_url, outtmpl, task, clean_title(v.title, page_url))
+                        file = self._download(url, page_url, outtmpl, task,
+                                              clean_title(v.title, page_url), label)
                     except Aborted:
                         return  # bleibt 'pending', .part wird beim nächsten Lauf fortgesetzt
                     except Exception as e:  # noqa: BLE001 - yt-dlp wirft sehr unterschiedliche Fehler
@@ -248,6 +258,7 @@ class Downloader:
                         errors.append(f"{url}: {msg.removeprefix('ERROR: ')}")
                         continue
                     self.state.video_done(page_url, file)
+                    self._cleanup(page_url, file)
                     with self._lock:
                         self.ok += 1
                     self.display.console.print(f"[green]✓[/] {label}", highlight=False)
@@ -284,6 +295,43 @@ class Downloader:
                 s.cookies.update(jar)
         return s
 
+    def _temp_dir(self, page_url: str, src_url: str) -> Path:
+        """Zwischenordner für .part/.ytdl/Fragmente: stabil pro (Videoseite, Quelle), Token egal."""
+        src = "page" if src_url == page_url else hashlib.sha1(
+            urlparse(src_url)._replace(query="", fragment="").geturl().encode()).hexdigest()[:10]
+        return self.out_dir / TMP_DIR / _page_tag(page_url) / src
+
+    def _cleanup(self, page_url: str, final: str | None) -> None:
+        """Nach Erfolg: Zwischenordner des Videos und Reste alter Versionen (.part neben der Datei) weg."""
+        shutil.rmtree(self.out_dir / TMP_DIR / _page_tag(page_url), ignore_errors=True)
+        if final:
+            for leftover in Path(final).parent.glob(glob_escape(Path(final).name) + ".*"):
+                if re.search(r"\.(part|ytdl)$|\.part-Frag\d+(\.part)?$", leftover.name):
+                    leftover.unlink(missing_ok=True)
+
+    def _watch_postprocessing(self, d: dict, task: TaskID, label: str, done: threading.Event) -> None:
+        files = self.display.files
+        info = d.get("info_dict") or {}
+        src = info.get("filepath") or info.get("_filename") or ""
+        inputs = [Path(p) for p in info.get("__files_to_merge") or [src] if p]
+        total = sum(p.stat().st_size for p in inputs if p.exists()) or None
+        name = {"FFmpegMerger": "Zusammenfügen"}.get(d.get("postprocessor"), "Umpacken")
+        files.update(task, description=f"⚙ {name}: {label}", total=total, completed=0)
+        if not src or not total:
+            return
+        stem = Path(src).with_suffix("")
+        pattern = glob_escape(stem.name) + ".temp.*"
+
+        def watch() -> None:
+            while not done.wait(0.5):  # bis der Postprocessor fertig ist
+                try:
+                    size = sum(p.stat().st_size for p in stem.parent.glob(pattern))
+                    files.update(task, completed=min(size, total))
+                except (OSError, KeyError):  # Datei gerade umbenannt / Anzeige-Task schon weg
+                    pass
+
+        threading.Thread(target=watch, daemon=True, name="pp-watch").start()
+
     def _fresh_media(self, page_url: str) -> list[str]:
         try:
             r = self._session().get(page_url, timeout=25)
@@ -293,24 +341,41 @@ class Downloader:
             return []
 
     def _download(self, url: str, referer: str, outtmpl: str, task: TaskID,
-                  title: str | None = None) -> str | None:
+                  title: str | None = None, label: str = "") -> str | None:
         files = self.display.files
 
         last_total = [None]
+        pp_done = threading.Event()
 
         def hook(d: dict) -> None:
             if self.stop.is_set():
                 raise Aborted()
             if d["status"] == "downloading":
+                done = d.get("downloaded_bytes") or 0
                 total = d.get("total_bytes") or d.get("total_bytes_estimate")
+                if not total and d.get("fragment_index") and d.get("fragment_count"):
+                    # Stream ohne Größenangabe: aus den bisher geladenen Teilen hochrechnen
+                    total = done / d["fragment_index"] * d["fragment_count"]
                 last_total[0] = total or last_total[0]
-                files.update(task, total=total, completed=d.get("downloaded_bytes") or 0)
+                files.update(task, total=total, completed=done)
             elif d["status"] == "finished":
                 done = d.get("total_bytes") or d.get("downloaded_bytes") or last_total[0] or 0
                 files.update(task, total=done, completed=done)
 
-        opts = dict(self.base_opts, outtmpl=outtmpl, progress_hooks=[hook],
-                    http_headers={"Referer": referer})
+        def pp_hook(d: dict) -> None:
+            # ffmpeg (Umpacken/Zusammenfügen) meldet keinen Fortschritt -> wachsende .temp-Datei beobachten
+            if d["status"] == "started" and d.get("postprocessor") not in _SILENT_PP:
+                pp_done.clear()
+                self._watch_postprocessing(d, task, label, pp_done)
+            elif d["status"] == "finished":
+                pp_done.set()
+                files.update(task, description=label)
+
+        opts = dict(self.base_opts, outtmpl=outtmpl, progress_hooks=[hook], postprocessor_hooks=[pp_hook],
+                    http_headers={"Referer": referer},
+                    # Halbfertiges pro Video UND Quelle getrennt: .part einer anderen Qualität/Quelle
+                    # wird nie "fortgesetzt" (sonst HTTP 416 oder ein still zusammengestückeltes Video)
+                    paths={"home": str(self.out_dir), "temp": str(self._temp_dir(referer, url))})
         ext = path_ext(url.rstrip("/"))
         with yt_dlp.YoutubeDL(opts) as ydl:
             # Cookies vom Seitenabruf mitgeben: Zugangs-Tokens in Links (z.B. v-acctoken)
