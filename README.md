@@ -10,8 +10,16 @@ Kommandozeilen-Tool, das eine Webseite crawlt und alle eingebetteten Videos arch
 - **Basiert auf [yt-dlp](https://github.com/yt-dlp/yt-dlp):** kennt über 1800 Seiten und viele eingebettete Player, KVS-Seiten eingeschlossen.
 
 ```
-<img width="1745" height="338" alt="image" src="https://github.com/user-attachments/assets/f0991862-73cb-470b-adc4-5e8ba6c0811b" />
-
+✓ Fiona Sprouts Gets Drilled By MattyRichXXX
+✓ Violetvossxo Gets Drilled By Alfie Cinematic's BWC
+✓ Mars Noire, Fiona Sprouts & Jill Palmer Suck Dick Together In Hottub
+✓ Violetvossxx Takes On Alfie Cinematic's BWC
+✓ Eva Elfie Gets Fucked In A Bar's Public Restroom
+⠙ Videos       ━━                              389/4683   ✓ 388  ✗ 1
+⠙ Crawl        ━━━━╸                           5026/31935 523 Videoseiten · bunny.com/videos/ema-karter-s-hotel-hook-up-with-a-stranger/
+  Natty_romanof_ Pleasures Her Pussy On Cam          ━━━━━━━                         23.9% 0.4/1.6 GB 2.0 MB/s  0:09:51
+  Petite Girl With A Big Ass Gets Fucked In The Pool ━━━━━━━━━━━━━━╸                 49.5% 0.6/1.3 GB 23.3 MB/s 0:00:28
+  Luna Vitaler Gets Fucked By The Pool Boy           ━━━━━━━━╸                       29.1% 0.3/1.2 GB 43.2 MB/s 0:00:19
 
 ```
 
