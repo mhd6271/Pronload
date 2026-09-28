@@ -10,10 +10,8 @@ Kommandozeilen-Tool, das eine Webseite crawlt und alle eingebetteten Videos arch
 - **Basiert auf [yt-dlp](https://github.com/yt-dlp/yt-dlp):** kennt über 1800 Seiten und viele eingebettete Player, KVS-Seiten eingeschlossen.
 
 ```
-  Videos     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  12/40   ✓ 11  ✗ 1
-  Crawl      ━━━━━━━━━━━╸━━━━━━━━━━━━━━━━━━  96/310  38 Videoseiten · /videos/beispiel-titel/
-    Beispiel Titel Eins                     ━━━━━━━━━━━━━━━━━━━━━━  61.2%  312.4/510.1 MB  8.2 MB/s  0:00:24
-    Noch Ein Video                          ━━━━━━━━━╸━━━━━━━━━━━━  38.9%  151.0/388.2 MB  6.9 MB/s  0:00:34
+<img width="1745" height="338" alt="image" src="https://github.com/user-attachments/assets/d41e6550-b622-4255-8884-5c67971ffcdf" />
+
 ```
 
 ## Installation
