@@ -11,6 +11,7 @@ from rich.live import Live
 from rich.table import Table
 
 from .crawler import Crawler, bare_host
+from .net import NetGuard
 from .downloader import Display, Downloader
 from .state import State, Video
 
@@ -131,12 +132,22 @@ def main(argv: list[str] | None = None) -> int:
                       "\n→ Start mit: [bold]pronload https://seite.tld/[/]")
         return 1
 
+    display = Display()
+    console = display.console
+    # Internet-Ausfall: alles pausieren, in wachsenden Abständen neu prüfen (Zeile nur bei Ausfall sichtbar)
+    net_task = display.overview.add_task("Netz", total=None, info="", visible=False)
+    guard = NetGuard(
+        {bare_host(u) for u in (args.urls or start_urls)},
+        on_status=lambda msg: display.overview.update(net_task, visible=msg is not None, info=msg or ""),
+        on_event=lambda msg: console.print(f"[yellow]{msg}[/]", highlight=False),
+    )
+
     crawler = Crawler(
         state, start_urls or args.urls, max_depth=settings["depth"], max_pages=args.max_pages,
         delay=settings["delay"], subdomains=settings["subdomains"], include=settings["include"],
         exclude=settings["exclude"], video_pattern=settings["video_pattern"],
         respect_robots=not settings["ignore_robots"], all_languages=settings["all_languages"],
-        cookies=args.cookies,
+        cookies=args.cookies, guard=guard,
     )
 
     if args.retry_failed:
@@ -174,15 +185,13 @@ def main(argv: list[str] | None = None) -> int:
                 n = crawler.seed_sitemaps(url)
                 console.print(f"Sitemap {url}: {n} Seiten eingereiht")
 
-    display = Display()
-    console = display.console
     dl = None
     with Live(display.renderable, console=console, refresh_per_second=4, transient=False):
         if not args.dry_run:
             dl = Downloader(state, out, display, workers=args.workers, fragments=args.fragments,
                             rate_limit=args.rate_limit, cookies=args.cookies,
                             cookies_from_browser=args.cookies_from_browser, sort=settings["sort"],
-                            verbose=args.verbose)
+                            verbose=args.verbose, guard=guard)
         crawl_task = display.overview.add_task("Crawl", total=None, info="")
         found = 0
 
@@ -219,6 +228,8 @@ def main(argv: list[str] | None = None) -> int:
             if dl:
                 dl.abort()
             return 130
+        finally:
+            guard.close()
 
     if dl:
         console.print(f"\n[bold]Fertig:[/] [green]{dl.ok} geladen[/], [red]{dl.failed} fehlgeschlagen[/] "

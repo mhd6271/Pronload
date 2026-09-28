@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -119,7 +120,10 @@ def build_site(root: Path) -> None:
         w(f"media/preview/{i}.mp4", os.urandom(1000))
 
 
-def serve(root: Path) -> ThreadingHTTPServer:
+NET = {"down": False, "media_down": False}
+
+
+def serve(root: Path, port: int = PORT) -> ThreadingHTTPServer:
     class Quiet(SimpleHTTPRequestHandler):
         def log_message(self, *a) -> None:
             pass
@@ -130,6 +134,9 @@ def serve(root: Path) -> ThreadingHTTPServer:
             super().end_headers()
 
         def do_GET(self) -> None:  # minimale Range-Unterstützung zum Testen von Fortsetzen
+            if NET["media_down"] and self.path.startswith("/media/"):
+                self.close_connection = True  # Verbindung ohne Antwort kappen = Netz weg
+                return
             REQUESTS.append(self.path)
             HOSTS.append(self.headers.get("Host", "").split(":")[0])
             if self.path.startswith("/get_file/2/") and "kt_session=ok" not in self.headers.get("Cookie", ""):
@@ -151,7 +158,7 @@ def serve(root: Path) -> ThreadingHTTPServer:
             self.end_headers()
             self.wfile.write(data[start:])
 
-    srv = ThreadingHTTPServer(("127.0.0.1", PORT), functools.partial(Quiet, directory=str(root)))
+    srv = ThreadingHTTPServer(("127.0.0.1", port), functools.partial(Quiet, directory=str(root)))
     srv.handle_error = lambda *a: None  # abgebrochene Verbindungen nicht loggen
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv
@@ -207,6 +214,45 @@ def test_parallel_claims() -> None:
         n = c.enqueue_many((f"https://x.test/viele/{i}/", 2, 1) for i in range(500))
         check(n == 500, "... pronload wiederholt trotzdem, bis die Sperre weg ist (500 Links in einer Transaktion)")
         check(st_mod.LOCK_PATIENCE >= 60, "Geduld bei Sperren reicht für parallele Terminals")
+
+
+def test_offline(site: Path, tmp: Path) -> None:
+    """Internet fällt aus: pausieren, später weitermachen, nichts zählt als Fehlversuch."""
+    import pronload.net as net
+    net.BACKOFF = [0.3]
+    net.probe_internet = lambda hosts=(): not (NET["down"] or NET["media_down"])
+
+    # 1) Beim Start kein Netz (Server nicht erreichbar), nach 1,5 s wieder da -> Crawler wartet
+    port = 8766
+    out = tmp / "offline1"
+    NET["down"] = True
+    servers: list[ThreadingHTTPServer] = []
+
+    def back_online() -> None:
+        servers.append(serve(site, port))
+        NET["down"] = False
+
+    threading.Timer(1.5, back_online).start()
+    t0 = time.monotonic()
+    rc = main([f"http://127.0.0.1:{port}/", "-o", str(out), "--delay", "0"])
+    servers[0].shutdown()
+    stats = State(out / ".pronload.db").stats()
+    check(rc == 0 and time.monotonic() - t0 >= 1.5, "Crawler pausiert ohne Netz und macht danach weiter")
+    check(stats.get("pages.error", 0) == 0 and stats.get("videos.done") == 5 and "videos.failed" not in stats,
+          f"Ausfall beim Crawlen zählt nicht als Fehler, alles geladen ({stats})")
+
+    # 2) Netz bricht während der Downloads weg -> Downloads warten, danach fertig
+    out = tmp / "offline2"
+    NET["media_down"] = True
+    threading.Timer(1.5, lambda: NET.update(media_down=False)).start()
+    rc = main([BASE + "/", "-o", str(out), "--delay", "0"])
+    stats = State(out / ".pronload.db").stats()
+    check(rc == 0 and stats.get("videos.done") == 5 and "videos.failed" not in stats,
+          f"Ausfall beim Download: gewartet statt fehlgeschlagen ({stats})")
+
+    # 3) Erreichbares Internet, aber die Seite selbst antwortet nicht -> normaler Fehler, keine Pause
+    check(not net.NetGuard(()).check(RuntimeError("HTTP Error 404: Not Found")),
+          "HTTP-Fehler der Seite ist kein Netzausfall")
 
 
 def run() -> None:
@@ -288,6 +334,8 @@ def run() -> None:
                   "offene Seite der anderen Domain bleibt liegen")
             settings = json.loads(st.get_meta("settings"))
             check(len(settings["start_urls"]) == 2, "beide Seiten bleiben im Ordner gespeichert")
+
+            test_offline(site, Path(tmp))
         finally:
             srv.shutdown()
     test_parallel_claims()

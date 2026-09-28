@@ -19,6 +19,7 @@ from rich.progress import (BarColumn, DownloadColumn, MofNCompleteColumn, Progre
 from rich.table import Column
 
 from .extract import USER_AGENT, analyze, path_ext, rank_media
+from .net import NetGuard
 
 DIRECT_EXT = (".mp4", ".m4v", ".webm", ".mkv", ".mov", ".flv")
 from .state import State, Video
@@ -109,8 +110,9 @@ class Downloader:
     def __init__(self, state: State, out_dir: Path, display: Display, *, workers: int = 3,
                  fragments: int = 4, rate_limit: str | None = None, cookies: str | None = None,
                  cookies_from_browser: str | None = None, sort: str = "site",
-                 verbose: bool = False) -> None:
+                 verbose: bool = False, guard: NetGuard | None = None) -> None:
         self.state, self.out_dir, self.display, self.sort = state, out_dir, display, sort
+        self.guard = guard
         self.verbose = verbose
         self.stop = threading.Event()
         self._pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="dl")
@@ -225,24 +227,39 @@ class Downloader:
                 yield from fresh
                 yield from (m for m in rank_media(media) if m not in fresh)  # beim Crawlen gespeicherte
 
-            for url in attempts():
-                try:
-                    file = self._download(url, page_url, outtmpl, task, clean_title(v.title, page_url))
-                except Aborted:
-                    return  # bleibt 'pending', .part wird beim nächsten Lauf fortgesetzt
-                except Exception as e:  # noqa: BLE001 - yt-dlp wirft sehr unterschiedliche Fehler
-                    if self.verbose:
-                        import traceback
-                        self.display.console.print(traceback.format_exc(), markup=False, highlight=False)
-                    msg = _ANSI.sub("", str(e)).strip()
-                    msg = msg.splitlines()[0] if msg else type(e).__name__
-                    errors.append(f"{url}: {msg.removeprefix('ERROR: ')}")
-                    continue
-                self.state.video_done(page_url, file)
-                with self._lock:
-                    self.ok += 1
-                self.display.console.print(f"[green]✓[/] {label}", highlight=False)
-                return
+            while True:
+                offline = False
+                for url in attempts():
+                    if self.guard and not self.guard.wait(self.stop.is_set):
+                        return  # abgebrochen während offline -> bleibt 'pending'
+                    try:
+                        file = self._download(url, page_url, outtmpl, task, clean_title(v.title, page_url))
+                    except Aborted:
+                        return  # bleibt 'pending', .part wird beim nächsten Lauf fortgesetzt
+                    except Exception as e:  # noqa: BLE001 - yt-dlp wirft sehr unterschiedliche Fehler
+                        if self.guard and self.guard.check(e):
+                            offline = True  # Internet weg: zählt nicht als Fehlversuch
+                            break
+                        if self.verbose:
+                            import traceback
+                            self.display.console.print(traceback.format_exc(), markup=False, highlight=False)
+                        msg = _ANSI.sub("", str(e)).strip()
+                        msg = msg.splitlines()[0] if msg else type(e).__name__
+                        errors.append(f"{url}: {msg.removeprefix('ERROR: ')}")
+                        continue
+                    self.state.video_done(page_url, file)
+                    with self._lock:
+                        self.ok += 1
+                    self.display.console.print(f"[green]✓[/] {label}", highlight=False)
+                    return
+                if not offline:
+                    break
+                # warten, dann dasselbe Video nochmal von vorn (die .part-Datei wird weiterverwendet)
+                files.update(task, description=f"⏸ {label}")
+                if not self.guard.wait(self.stop.is_set):
+                    return
+                files.update(task, description=label)
+                errors.clear()
             self.state.video_failed(page_url, " || ".join(errors) or "kein Video gefunden")
             with self._lock:
                 self.failed += 1

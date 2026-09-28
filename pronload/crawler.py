@@ -13,10 +13,15 @@ import requests
 
 from .downloader import _SEPARATORS, clean_title
 from .extract import USER_AGENT, PageInfo, analyze, lang_prefix, link_label, url_priority
+from .net import NetGuard
 from .state import State, Video
 
 MAX_HTML = 8 * 1024 * 1024
 _LOC_RE = re.compile(r"<loc>\s*(.*?)\s*</loc>", re.IGNORECASE | re.DOTALL)
+
+
+class _Offline(Exception):
+    """Abruf gescheitert, weil das Internet weg ist."""
 
 
 def bare_host(url: str) -> str:
@@ -29,8 +34,10 @@ class Crawler:
                  max_pages: int | None = None, delay: float = 0.5, subdomains: bool = False,
                  include: str | None = None, exclude: str | None = None,
                  video_pattern: str | None = None, respect_robots: bool = True,
-                 all_languages: bool = False, cookies: str | None = None) -> None:
+                 all_languages: bool = False, cookies: str | None = None,
+                 guard: NetGuard | None = None) -> None:
         self.state = state
+        self.guard = guard
         self.hosts = {bare_host(u) for u in start_urls}
         # Sprachversionen (/de/, /es/ …) überspringen - außer der Sprache der Start-URL(s)
         self.all_languages = all_languages
@@ -84,7 +91,8 @@ class Crawler:
                 r = self.session.get(origin + "/robots.txt", timeout=15)
                 rp.parse(r.text.splitlines() if r.ok else [])
             except requests.RequestException:
-                rp.parse([])
+                # nicht merken: war es ein Netzausfall, wird robots.txt beim nächsten Mal richtig gelesen
+                return True
             self._robots[origin] = rp
         rp = self._robots[origin]
         return rp.can_fetch(USER_AGENT, url) if rp else True
@@ -182,6 +190,11 @@ class Crawler:
             on_tick(url)
             try:
                 self._process(url, depth, on_video)
+            except _Offline:
+                # Internet weg: Seite zurück, warten bis es wieder geht (zählt nicht als Fehler)
+                self.state.unfetch(url)
+                if not self.guard.wait(should_stop):
+                    break
             except Exception as e:  # noqa: BLE001 - eine kaputte Seite darf den Lauf nicht beenden
                 self.errors.append(f"{url}: {type(e).__name__}: {e}")
                 self.state.finish_page(url, "error")  # beim nächsten Lauf nochmal
@@ -204,7 +217,9 @@ class Crawler:
             code = e.response.status_code if e.response is not None else 500
             self.state.finish_page(url, "done" if 400 <= code < 500 and code != 429 else "error")
             return
-        except requests.RequestException:
+        except requests.RequestException as e:
+            if self.guard and self.guard.check(e):
+                raise _Offline() from e
             self.state.finish_page(url, "error")
             return
         self.fetched += 1

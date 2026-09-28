@@ -75,6 +75,13 @@ Mit **Strg+C** wird sauber abgebrochen. Halbfertige `.part`-Dateien bleiben lieg
 
 Einstellungen wie Tiefe, Filter und Sortierung werden pro Zielordner gespeichert. `pronload -o <Ordner>` ohne URL läuft dann mit denselben Einstellungen weiter.
 
+### Wenn das Internet weg ist
+
+pronload merkt einen Verbindungsausfall selbst. Bei einem Netzwerkfehler (DNS, Verbindung, Timeout) prüft es, ob überhaupt Internet da ist: Es verbindet sich mit 1.1.1.1, 8.8.8.8 bzw. 9.9.9.9 und löst den Namen der Zielseite auf.
+- **Internet weg:** Crawler und alle Downloads pausieren. Neu geprüft wird nach 10 s, 30 s, 1 min, 2 min und danach alle 5 min, so lange, bis es wieder geht oder du mit Strg+C abbrichst.
+- **Nichts geht verloren:** Was während des Ausfalls scheitert, zählt nicht als Fehlversuch. Seiten gehen zurück in die Warteschlange, Downloads laufen an derselben Stelle weiter.
+- **Nur die Seite ist down, das Internet aber da:** Das gilt als normaler Fehler, die Seite oder das Video wird beim nächsten Lauf erneut versucht.
+
 ### Mehrere Seiten, mehrere Terminals
 
 Ein Archivordner kann beliebig viele Seiten enthalten. Jede bekommt ihren eigenen Unterordner (`D:\Archiv\seite-a.com\…`, `D:\Archiv\seite-b.com\…`).
