@@ -10,7 +10,7 @@ from rich.console import Console
 from rich.live import Live
 from rich.table import Table
 
-from .crawler import Crawler
+from .crawler import Crawler, bare_host
 from .downloader import Display, Downloader
 from .state import State, Video
 
@@ -144,6 +144,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.refresh or settings["_depth_raised"]:
         console.print(f"{state.refresh_listings()} Übersichtsseiten neu eingereiht")
     state.requeue_page_errors()
+    state.release_stale()
+
+    # Mit URL(s): nur diese Seite(n) bearbeiten. Andere Seiten im selben Ordner bleiben liegen
+    # (eigener Tab oder später "pronload -o <Ordner>" ohne URL, der macht alles).
+    focus = {bare_host(u) for u in args.urls} or None
+    if focus:
+        others = {bare_host(u) for u in start_urls} - focus
+        console.print(f"Fokus: [bold]{', '.join(sorted(focus))}[/]" +
+                      (f" [dim](liegen gelassen: {', '.join(sorted(others))})[/]" if others else ""))
 
     if args.no_crawl:
         for url in args.urls:
@@ -188,17 +197,17 @@ def main(argv: list[str] | None = None) -> int:
                               highlight=False)
 
         def on_tick(url: str) -> None:
-            done, queued = state.queue_sizes()
+            done, queued = state.queue_sizes(focus)
             display.overview.update(crawl_task, total=done + queued, completed=done,
                                     info=f"{found} Videoseiten · {url[-60:]}")
 
         try:
             if dl:  # Unfertiges vom letzten Lauf zuerst (inkl. .part-Fortsetzung)
-                for video in state.pending_videos(MAX_ATTEMPTS):
+                for video in state.pending_videos(MAX_ATTEMPTS, focus):
                     dl.submit(video)
             if not args.no_crawl:
-                crawler.run(on_video, on_tick, should_stop=lambda: False)
-            done, queued = state.queue_sizes()
+                crawler.run(on_video, on_tick, should_stop=lambda: False, focus=focus)
+            done, queued = state.queue_sizes(focus)
             display.overview.update(crawl_task, total=done + queued, completed=done,
                                     info=f"fertig · {found} Videoseiten" +
                                          (f" · {queued} Seiten offen (--max-pages)" if queued else ""))

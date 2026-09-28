@@ -118,6 +118,8 @@ class Downloader:
         self._lock = threading.Lock()
         self.ok = self.failed = self._submitted = 0
         self.overall = display.overview.add_task("Videos", total=0, info="")
+        self._closed = threading.Event()
+        threading.Thread(target=self._heartbeat, daemon=True, name="claims").start()
         self._http = requests.Session()
         self._http.headers["User-Agent"] = USER_AGENT
         if cookies:
@@ -157,6 +159,9 @@ class Downloader:
         with self._lock:
             if video.page_url in self._active:
                 return
+            # lädt gerade ein anderer pronload-Prozess (anderer Tab) dasselbe Video? -> überspringen
+            if not self.state.claim_video(video.page_url):
+                return
             self._active.add(video.page_url)
             self._submitted += 1
             self.display.overview.update(self.overall, total=self._submitted)
@@ -171,10 +176,24 @@ class Downloader:
         while self.busy():
             time.sleep(0.2)
         self._pool.shutdown(wait=True)
+        self._close()
 
     def abort(self) -> None:
         self.stop.set()
         self._pool.shutdown(wait=True, cancel_futures=True)
+        self._close()
+
+    def _close(self) -> None:
+        self._closed.set()
+        self.state.release_all()  # übrige Reservierungen sofort für andere Tabs freigeben
+
+    def _heartbeat(self) -> None:
+        # Reservierungen regelmäßig erneuern; stirbt der Prozess, laufen sie nach CLAIM_TTL ab
+        while not self._closed.wait(30):
+            try:
+                self.state.touch_claims()
+            except Exception:  # noqa: BLE001 - DB kurz gesperrt: beim nächsten Mal
+                pass
 
     # ------------------------------------------------------------------------
     def _outtmpl(self, v: Video) -> str:

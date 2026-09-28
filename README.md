@@ -75,6 +75,19 @@ Mit **Strg+C** wird sauber abgebrochen. Halbfertige `.part`-Dateien bleiben lieg
 
 Einstellungen wie Tiefe, Filter und Sortierung werden pro Zielordner gespeichert. `pronload -o <Ordner>` ohne URL läuft dann mit denselben Einstellungen weiter.
 
+### Mehrere Seiten, mehrere Terminals
+
+Ein Archivordner kann beliebig viele Seiten enthalten. Jede bekommt ihren eigenen Unterordner (`D:\Archiv\seite-a.com\…`, `D:\Archiv\seite-b.com\…`).
+
+- **Mit URL** kümmert sich ein Lauf nur um diese Seite, beim Crawlen wie beim Laden. Offenes von anderen Seiten im selben Ordner bleibt liegen.
+- **Ohne URL** (`pronload -o D:\Archiv`) wird alles abgearbeitet, was im Ordner offen ist.
+- **Mehrere Terminals gleichzeitig** auf denselben Ordner sind sicher, zum Beispiel ein Terminal pro Seite. Jeder Prozess reserviert die Seiten und Videos, an denen er arbeitet, und die anderen überspringen sie. So wird keine Datei doppelt oder gleichzeitig geladen. Stürzt ein Prozess ab, laufen seine Reservierungen nach 3 Minuten aus.
+
+```
+# Terminal 1                                   # Terminal 2
+pronload https://seite-a.com/ -o D:\Archiv     pronload https://seite-b.com/ -o D:\Archiv
+```
+
 ## Abspielen: `pronload play`
 
 ```

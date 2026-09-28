@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import functools
+import json
 import os
 import sys
 import tempfile
@@ -17,6 +18,7 @@ from pronload.state import State  # noqa: E402
 PORT = 8765
 RANGE_REQUESTS: list[tuple[str, str]] = []
 REQUESTS: list[str] = []
+HOSTS: list[str] = []
 BASE = f"http://127.0.0.1:{PORT}"
 
 NAV = """<nav><a href="/categories/amateur/">Amateur</a><a href="/categories/outdoor/">Outdoor</a>
@@ -112,6 +114,7 @@ def serve(root: Path) -> ThreadingHTTPServer:
 
         def do_GET(self) -> None:  # minimale Range-Unterstützung zum Testen von Fortsetzen
             REQUESTS.append(self.path)
+            HOSTS.append(self.headers.get("Host", "").split(":")[0])
             if self.path.startswith("/get_file/"):
                 self.path = self.path.rstrip("/")  # KVS-Links enden auf ".mp4/"
             rng = self.headers.get("Range")
@@ -146,6 +149,32 @@ def test_detection() -> None:
     vp = analyze(BASE + "/videos/x/", video_page("x", "T", "m", "c"))
     check(vp.is_video_page, "Videoseite erkannt")
     check(vp.title == "T - FakeTube", "Titel gelesen")
+
+
+def test_parallel_claims() -> None:
+    """Zwei Prozesse (= zwei Tabs) auf derselben Datenbank dürfen sich nicht in die Quere kommen."""
+    from pronload.state import CLAIM_TTL, Video
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        db = Path(tmp) / ".pronload.db"
+        a, b = State(db), State(db)
+        for i in range(3):
+            a.enqueue(f"https://x.test/videos/v{i}/", 1)
+        pages = {a.next_page()[0], b.next_page()[0], a.next_page()[0]}
+        check(len(pages) == 3 and a.next_page() is None and b.next_page() is None,
+              "Seiten werden atomar reserviert – kein Tab holt dieselbe Seite")
+
+        a.add_video(Video("https://x.test/videos/v0/"))
+        check(a.claim_video("https://x.test/videos/v0/"), "Tab A reserviert ein Video")
+        check(not b.claim_video("https://x.test/videos/v0/"), "Tab B bekommt dasselbe Video nicht")
+        check(b.pending_videos(3) == [], "Tab B sieht es auch nicht als offen")
+        a._q("UPDATE videos SET claimed_at = claimed_at - ?", (CLAIM_TTL + 1,))
+        check(b.claim_video("https://x.test/videos/v0/"), "abgelaufene Reservierung (Absturz) wird übernommen")
+        b.release_all()
+        check(a.claim_video("https://x.test/videos/v0/"), "nach Freigabe wieder verfügbar")
+
+        a._q("UPDATE pages SET claimed_at = claimed_at - 400 WHERE status='fetching'")
+        b.release_stale()
+        check(a.queue_sizes()[1] == 3, "hängengebliebene Seiten-Reservierungen werden freigegeben")
 
 
 def run() -> None:
@@ -213,8 +242,21 @@ def run() -> None:
             check(target.exists() and target.read_bytes() == original, "Datei nach Fortsetzen vollständig & korrekt")
             check(any(r == "bytes=700000-" for _, r in RANGE_REQUESTS),
                   f"nur der Rest wurde geladen (Range ab Byte 700000): {RANGE_REQUESTS}")
+
+            # Fokus: zweite Seite (localhost) im selben Ordner, während für 127.0.0.1 noch was offen ist
+            st = State(out / ".pronload.db")
+            st.enqueue(BASE + "/page/2/?liegen=1", 1)
+            HOSTS.clear()
+            rc = main(["http://localhost:8765/", "-o", str(out), "--dry-run", "--delay", "0"])
+            check(rc == 0, "Lauf mit zweiter Seite endet sauber")
+            check(HOSTS and set(HOSTS) == {"localhost"}, f"Fokus: nur die angegebene Seite angefragt ({set(HOSTS)})")
+            check(st._q("SELECT status FROM pages WHERE url LIKE '%liegen=1'") == [("queued",)],
+                  "offene Seite der anderen Domain bleibt liegen")
+            settings = json.loads(st.get_meta("settings"))
+            check(len(settings["start_urls"]) == 2, "beide Seiten bleiben im Ordner gespeichert")
         finally:
             srv.shutdown()
+    test_parallel_claims()
     print("\nalles grün")
 
 

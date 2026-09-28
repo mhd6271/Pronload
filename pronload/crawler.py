@@ -169,46 +169,54 @@ class Crawler:
 
     # --- Hauptschleife -------------------------------------------------------
     def run(self, on_video: Callable[[Video], None], on_tick: Callable[[str], None],
-            should_stop: Callable[[], bool]) -> None:
+            should_stop: Callable[[], bool], focus: set[str] | None = None) -> None:
+        """focus: nur Seiten dieser Hosts abarbeiten (andere bleiben für spätere Läufe liegen)."""
         while not should_stop():
             if self.max_pages is not None and self.fetched >= self.max_pages:
                 break
-            nxt = self.state.next_page()
+            nxt = self.state.next_page(focus)  # reserviert die Seite gleich (parallele Tabs)
             if not nxt:
                 break
             url, depth = nxt
             on_tick(url)
-            if depth > 0 and not self.in_scope(url):
-                # stand schon in der Warteschlange, passt aber nicht (mehr) zu den Filtern
-                self.state.finish_page(url, "skipped")
-                continue
-            if not self.allowed(url):
-                self.state.finish_page(url, "done")
-                continue
             try:
-                text = self.fetch_html(url)
-            except requests.HTTPError as e:
-                # 4xx = Seite gibt's nicht (mehr) -> erledigt; 5xx beim nächsten Lauf nochmal
-                code = e.response.status_code if e.response is not None else 500
-                self.state.finish_page(url, "done" if 400 <= code < 500 and code != 429 else "error")
-                continue
-            except requests.RequestException:
-                self.state.finish_page(url, "error")
-                continue
-            self.fetched += 1
-            if text is None:
-                self.state.finish_page(url, "done")
-                continue
+                self._process(url, depth, on_video)
+            except BaseException:
+                self.state.unfetch(url)  # Strg+C mitten im Abruf: Seite zurück in die Warteschlange
+                raise
 
-            info = analyze(url, text)
-            is_video = bool(self.video_pattern.search(url)) if self.video_pattern else info.is_video_page
-            if is_video:
-                on_video(self.to_video(info))
-            elif depth == 0:
-                # Kategorie-/Model-Links der Startseite = Navigation, gilt für jede Seite
-                self.learn_site(info)
-            if self.max_depth is None or depth < self.max_depth:
-                for link in info.links:
-                    if self.in_scope(link):
-                        self.state.enqueue(link, depth + 1, self.priority(link))
-            self.state.finish_page(url, "done", is_video)
+    def _process(self, url: str, depth: int, on_video: Callable[[Video], None]) -> None:
+        if depth > 0 and not self.in_scope(url):
+            # stand schon in der Warteschlange, passt aber nicht (mehr) zu den Filtern
+            self.state.finish_page(url, "skipped")
+            return
+        if not self.allowed(url):
+            self.state.finish_page(url, "done")
+            return
+        try:
+            text = self.fetch_html(url)
+        except requests.HTTPError as e:
+            # 4xx = Seite gibt's nicht (mehr) -> erledigt; 5xx beim nächsten Lauf nochmal
+            code = e.response.status_code if e.response is not None else 500
+            self.state.finish_page(url, "done" if 400 <= code < 500 and code != 429 else "error")
+            return
+        except requests.RequestException:
+            self.state.finish_page(url, "error")
+            return
+        self.fetched += 1
+        if text is None:
+            self.state.finish_page(url, "done")
+            return
+
+        info = analyze(url, text)
+        is_video = bool(self.video_pattern.search(url)) if self.video_pattern else info.is_video_page
+        if is_video:
+            on_video(self.to_video(info))
+        elif depth == 0:
+            # Kategorie-/Model-Links der Startseite = Navigation, gilt für jede Seite
+            self.learn_site(info)
+        if self.max_depth is None or depth < self.max_depth:
+            for link in info.links:
+                if self.in_scope(link):
+                    self.state.enqueue(link, depth + 1, self.priority(link))
+        self.state.finish_page(url, "done", is_video)
